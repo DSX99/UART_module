@@ -1,259 +1,92 @@
-from amaranth import *
-from amaranth.sim import Simulator
-import random
-from litex.soc.interconnect.csr import *
-from amaranth import Module as AmaranthModule
-from litex.gen import *
 from litex.soc.interconnect.csr_eventmanager import EventManager, EventSourceProcess
-from litex_boards.targets import sipeed_tang_nano_20k
-from litex.soc.integration.soc_core import SoCCore
-from litex.soc.integration.builder import Builder
+from UART_mod import *
+from amaranth.back import verilog as am_verilog
+import migen as mg
+from litex.soc.interconnect.csr import AutoCSR, CSRStorage, CSRStatus
 
-class UART_tx(Elaboratable):
-    def __init__(self):
-        self.divisor_reg = Signal(16)
+class UART_Custom(mg.Module, AutoCSR):
+    def __init__(self, platform, pads):
+        self.platform = platform
         
-        self.tx_req = Signal()
-        self.tx_buff = Signal(8)
-        self.tx_rdy = Signal() 
-        self.tx = Signal()
-
-    def elaborate(self,platform):
-        m = Module()
-        
-        tx_data = Signal(8)
-        parity = Signal()
-        tx_data_counter = Signal(4)
-        tx_clk_counter = Signal(16)
-        
-        with m.If(tx_clk_counter+1 == self.divisor_reg):
-            m.d.sync += tx_clk_counter.eq(0)
-        with m.Else():
-            m.d.sync += tx_clk_counter.eq(tx_clk_counter+1)
-        
-        with m.FSM(name='tx_FSM'):
-            with m.State("WAIT"):
-                m.d.sync += self.tx.eq(1)
-                m.d.comb += self.tx_rdy.eq(1)
-                
-                with m.If(self.tx_req):
-                    m.d.comb += self.tx_rdy.eq(0)
-                    m.d.sync += [
-                        self.tx.eq(0),
-                        tx_data.eq(self.tx_buff),
-                        parity.eq(self.tx_buff.xor()),
-                        tx_clk_counter.eq(1)
-                    ]
-                    m.next = "DATA"
-            with m.State("DATA"):
-                m.d.comb += self.tx_rdy.eq(0)
-                
-                with m.If(tx_clk_counter == 0):
-                    m.d.sync += [
-                        self.tx.eq(tx_data[0]),
-                        tx_data.eq(tx_data>>1),
-                        tx_data_counter.eq(tx_data_counter+1)
-                    ]
-                    
-                with m.If(tx_data_counter[3]):
-                    m.next ="PARITY"
-            with m.State("PARITY"):
-                with m.If(tx_clk_counter == 0):
-                    m.d.sync += self.tx.eq(parity)
-                    m.next="STOP"
-            with m.State("STOP"):
-                m.d.comb += self.tx_rdy.eq(0)
-                
-                with m.If(tx_clk_counter == 0):
-                    m.d.sync += [
-                        self.tx.eq(1),
-                        tx_data_counter.eq(0)
-                    ]
-                    m.next="WAIT"
-        
-        return m
-
-class UART_rx(Elaboratable):
-    def __init__(self):
-        self.divisor_reg = Signal(16)
-        
-        self.rx_rdy = Signal()
-        self.rx_buff = Signal(8)
-        self.rx_error = Signal()
-        self.rx = Signal()
-    
-    def elaborate(self,platform):
-        m = Module()
-        
-        #RX
-        #clk_counter assumes 16x oversampling, so needs only 12 bits
-        rx_clk_counter = Signal(12)
-        rx_data_counter = Signal(4)
-        rx_oversample_counter = Signal(4)
-        rx_data = Signal(8)
-        rx_sync = Signal(3)
-        
-        with m.If(rx_clk_counter+1 == self.divisor_reg>>4):
-            m.d.sync += rx_clk_counter.eq(0)
-        with m.Else():
-            m.d.sync += rx_clk_counter.eq(rx_clk_counter+1)
-            
-        with m.FSM(name='rx_FSM'):
-            with m.State("WAIT"):
-                m.d.sync += [
-                    self.rx_rdy.eq(0)
-                ]
-                with m.If(~self.rx & rx_clk_counter):
-                    m.d.sync += [
-                        rx_sync.eq(self.rx),
-                        rx_clk_counter.eq(0)
-                    ]
-                    m.next="START"
-            with m.State("START"):
-                with m.If(rx_clk_counter == 0):
-                    with m.If(rx_oversample_counter == 7):
-                        m.d.sync += [
-                            rx_sync[0].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 8):
-                        m.d.sync += [
-                            rx_sync[1].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 9):
-                        m.d.sync += [
-                            rx_sync[2].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 15):
-                        with m.If(((rx_sync[0]&rx_sync[1])|(rx_sync[1]&rx_sync[2])|(rx_sync[0]&rx_sync[2])) == 0):
-                            m.next=("DATA")
-                            m.d.sync += rx_oversample_counter.eq(0)
-                        with m.Else():
-                            m.next=("WAIT")
-                    with m.Else():
-                        m.d.sync += rx_oversample_counter.eq(rx_oversample_counter+1)
-            with m.State("DATA"):
-                with m.If(rx_clk_counter == 0):
-                    with m.If(rx_data_counter==8):
-                        m.next=("PARITY")
-                    with m.Elif(rx_oversample_counter == 7):
-                        m.d.sync += [
-                            rx_sync[0].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 8):
-                        m.d.sync += [
-                            rx_sync[1].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 9):
-                        m.d.sync += [
-                            rx_sync[2].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 15):
-                        m.d.sync += [
-                            rx_data.eq(Cat(rx_data[1:8],(rx_sync[0]&rx_sync[1])|(rx_sync[1]&rx_sync[2])|(rx_sync[0]&rx_sync[2]))),
-                            rx_data_counter.eq(rx_data_counter+1),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Else():
-                        m.d.sync += rx_oversample_counter.eq(rx_oversample_counter+1)
-            with m.State("PARITY"):
-                with m.If(rx_clk_counter == 0):
-                    with m.If(rx_oversample_counter == 7):
-                        m.d.sync += [
-                            rx_sync[0].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 8):
-                        m.d.sync += [
-                            rx_sync[1].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 9):
-                        m.d.sync += [
-                            rx_sync[2].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 15):
-                        parity = (rx_sync[0]&rx_sync[1])|(rx_sync[1]&rx_sync[2])|(rx_sync[0]&rx_sync[2])
-                        m.d.sync += [
-                            self.rx_error.eq(rx_data.xor() ^ parity),
-                            self.rx_buff.eq(rx_data),
-                            rx_oversample_counter.eq(0)
-                        ]
-                        m.next=("STOP")
-                    with m.Else():
-                        m.d.sync += rx_oversample_counter.eq(rx_oversample_counter+1)
-            with m.State("STOP"):
-                with m.If(rx_clk_counter == 0):
-                    with m.If(rx_oversample_counter == 7):
-                        m.d.sync += [
-                            rx_sync[0].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 8):
-                        m.d.sync += [
-                            rx_sync[1].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 9):
-                        m.d.sync += [
-                            rx_sync[2].eq(self.rx),
-                            rx_oversample_counter.eq(rx_oversample_counter+1)
-                        ]
-                    with m.Elif(rx_oversample_counter == 15):
-                        m.d.sync += [
-                            self.rx_error.eq(~(((rx_sync[0]&rx_sync[1])|(rx_sync[1]&rx_sync[2])|(rx_sync[0]&rx_sync[2]))==1)|self.rx_error),
-                            self.rx_rdy.eq(1),
-                            rx_data_counter.eq(0),
-                            rx_oversample_counter.eq(0)
-                        ]
-                        m.next=("WAIT")
-                    with m.Else():
-                        m.d.sync += rx_oversample_counter.eq(rx_oversample_counter+1)
-        return m
-
-class UART_Custom(Module, AutoCSR):
-    def __init__(self):
-        self.divisor = CSRStorage(16)
-        self.tx_data = CSRStorage(8)
-        self.tx_req = CSRStorage(1)
-        self.status = CSRStatus(fields=[
-            CSRField("tx_rdy", offset=0, description="TX is ready"),
-            CSRField("rx_rdy", offset=1, description="RX has data available"),
-            CSRField("rx_err", offset=2, description="RX Error flag"),
-        ])
+        self.rxtx    = CSRStorage(8)
         self.rx_data = CSRStatus(8)
-
-        self.submodules.tx = tx = UART_tx()
-        self.submodules.rx = rx = UART_rx()
+        self.txfull  = CSRStatus()
+        self.rxempty = CSRStatus()
+        self.divisor = CSRStorage(16, reset=234)
 
         self.submodules.ev = EventManager()
-        self.ev.rx_done = EventSourceProcess()
+        self.ev.tx = EventSourceProcess()
+        self.ev.rx = EventSourceProcess()
+        self.ev.finalize()
         
-        self.comb += [
-            tx.divisor_reg.eq(self.divisor.storage),
-            rx.divisor_reg.eq(self.divisor.storage),
-            
-            tx.tx_buff.eq(self.tx_data.storage),
-            tx.tx_req.eq(self.tx_req.re),
+        tx_rdy_bridge = mg.Signal()
+        rx_rdy_bridge = mg.Signal()
+        rx_byte_bridge = mg.Signal(8)
+        rx_pending = mg.Signal()
+        rx_buffer  = mg.Signal(8)
 
-            self.rx_data.status.eq(rx.rx_buff),
+        tx_logic = UART_tx()
+        rx_logic = UART_rx()
+        
+        v_tx = am_verilog.convert(tx_logic, name="uart_tx", ports=[
+            tx_logic.divisor_reg, tx_logic.tx_buff, tx_logic.tx_req, 
+            tx_logic.tx, tx_logic.tx_rdy
+        ])
+        v_rx = am_verilog.convert(rx_logic, name="uart_rx", ports=[
+            rx_logic.divisor_reg, rx_logic.rx, rx_logic.rx_buff, 
+            rx_logic.rx_rdy
+        ])
 
-            self.status.fields.tx_rdy.eq(tx.tx_rdy),
-            self.status.fields.rx_rdy.eq(rx.rx_rdy),
-            self.status.fields.rx_err.eq(rx.rx_error),
-                    
-            self.ev.rx_done.trigger.eq(self.rx.rx_rdy)
+        self.specials += mg.Instance("uart_tx",
+            i_clk         = mg.ClockSignal(),
+            i_rst         = mg.ResetSignal(),
+            i_divisor_reg = self.divisor.storage,
+            i_tx_buff     = self.rxtx.storage,
+            i_tx_req      = self.rxtx.re,
+            o_tx          = pads.tx,
+            o_tx_rdy      = tx_rdy_bridge
+        )
+
+        self.specials += mg.Instance("uart_rx",
+            i_clk         = mg.ClockSignal(),
+            i_rst         = mg.ResetSignal(),
+            i_divisor_reg = self.divisor.storage,
+            i_rx          = pads.rx,
+            o_rx_buff     = rx_byte_bridge,
+            o_rx_rdy      = rx_rdy_bridge
+        )
+
+        self.sync += [
+            mg.If(rx_rdy_bridge,
+                rx_pending.eq(1),
+                rx_buffer.eq(rx_byte_bridge)
+            ),
+            mg.If(self.rxtx.re,
+                rx_pending.eq(0)
+            )
         ]
-        
-        self.tx = tx.tx
-        self.rx = rx.rx
 
+        self.comb += [
+            self.txfull.status.eq(~tx_rdy_bridge),
+            self.rxempty.status.eq(~rx_pending),
+            self.rx_data.status.eq(rx_buffer)
+        ]
+
+        self._verilog_tx = v_tx
+        self._verilog_rx = v_rx
+
+    def do_finalize(self):
+        import os
+        gen_dir = os.path.join(self.platform.output_dir, "gateware")
+        os.makedirs(gen_dir, exist_ok=True)
+        tx_path = os.path.join(gen_dir, "uart_tx.v")
+        rx_path = os.path.join(gen_dir, "uart_rx.v")
+        with open(tx_path, "w") as f: f.write(self._verilog_tx)
+        with open(rx_path, "w") as f: f.write(self._verilog_rx)
+        self.platform.add_source(tx_path)
+        self.platform.add_source(rx_path)
+        
+        
 #tb send value on tx, expect same on rx
 
 # class UART_Loopback_Test(Elaboratable):
@@ -432,22 +265,19 @@ class UART_Custom(Module, AutoCSR):
 #         sim.run()
 
 
-class SoC_Custom(sipeed_tang_nano_20k.BaseSoC):
-    def __init__(self, **kwargs):
-        sipeed_tang_nano_20k.BaseSoC.__init__(self, **kwargs)
+# class SoC_Custom(sipeed_tang_nano_20k.BaseSoC):
+#     def __init__(self, **kwargs):
+#         sipeed_tang_nano_20k.BaseSoC.__init__(self, **kwargs)
+        
+#         self.platform = sipeed_tang_nano_20k.Platform()
+        
+#         serial_pads = self.platform.request("serial")
 
-        serial_pads = self.platform.request("uart")
+#         self.submodules.my_uart = UART_Custom(self.platform)
+#         self.add_csr("uart_custom")
+#         self.add_interrupt("uart_custom")
 
-        self.submodules.my_uart = UART_Custom(self.platform)
-        self.add_csr("my_uart")
-        self.add_interrupt("my_uart")
-
-        self.comb += [
-            serial_pads.tx.eq(self.my_uart.tx),
-            self.my_uart.rx.eq(serial_pads.rx)
-        ]
-
-# 5. Build it!
-soc = SoC_Custom(cpu_type="vexriscv")
-builder = Builder(soc, output_dir="build", compile_software=True)
-builder.build()
+#         self.comb += [
+#             serial_pads.tx.eq(self.my_uart.tx),
+#             self.my_uart.rx.eq(serial_pads.rx)
+#         ]
